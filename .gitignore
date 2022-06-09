@@ -1,0 +1,10 @@
+*.bak
+*.bat
+*.log
+tmp/
+
+__pycache__/
+*.py[cod]
+*.egg-info
+build/
+dist/

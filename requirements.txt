@@ -1,0 +1,4 @@
+bencodepy
+genutility
+qbittorrent-api
+requests
