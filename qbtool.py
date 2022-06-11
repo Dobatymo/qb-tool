@@ -9,6 +9,7 @@ import bencodepy
 import qbittorrentapi
 import requests
 from genutility.args import is_dir
+from genutility.filesystem import scandir_rec_simple
 from genutility.iter import batch, retrier
 from genutility.json import json_lines
 from genutility.time import TakeAtleast
@@ -240,9 +241,9 @@ class InversePathTree:
 def _build_inverse_tree(basepath: Path) -> InversePathTree:
 
     tree = InversePathTree()
-    for path in basepath.rglob("*"):
-        if path.is_file():
-            tree.add(path, path.stat().st_size)
+    for entry in scandir_rec_simple(fspath(basepath)):
+        if entry.is_file():
+            tree.add(Path(entry.path), entry.stat().st_size)
 
     return tree
 
@@ -258,14 +259,16 @@ def _load_torrent_info(path: str) -> Optional[dict]:
 
 def find_torrents(client, args) -> None:
     infos = {}
-    for file in args.torrents_dir.rglob("*.torrent"):
-        info = _load_torrent_info(file)
-        if info is None:
-            continue
+    for dir in args.torrents_dirs:
+        for file in dir.rglob("*.torrent"):
+            info = _load_torrent_info(file)
+            if info is None:
+                continue
 
-        infos[fspath(file)] = info
+            infos[fspath(file)] = info
 
-    logging.info("Loaded %s torrents from <%s>", len(infos), args.torrents_dir)
+    dirs = ", ".join(f"<{dir}>" for dir in args.torrents_dirs)
+    logging.info("Loaded %s torrents from %s", len(infos), dirs)
 
     for dir in args.data_dirs:
         invtree = _build_inverse_tree(dir)
@@ -289,8 +292,12 @@ def find_torrents(client, args) -> None:
                 logging.debug("Found path, but no size matches for %s", info)
             elif len(meta_matches) == 1:
                 full_path = meta_matches[0] / single_file
-                assert full_path.exists()
+                if not full_path.exists():
+                    logging.error("File does not exist: <%s>", full_path)
+                    continue
+
                 print(f"Found possible match for {torrent_file}: {full_path}")
+                num_add_try += 1
                 if args.do_add:
                     result = client.torrents_add(
                         torrent_files=torrent_file,
@@ -298,7 +305,6 @@ def find_torrents(client, args) -> None:
                         is_skip_checking=False,
                         is_paused=False,
                     )
-                    num_add_try += 1
                     if result == "Fails.":
                         logging.error("Failed to add %s", torrent_file)
                         num_add_fail += 1
@@ -371,7 +377,7 @@ if __name__ == "__main__":
     parser_g = subparsers.add_parser(
         "find-torrents", help="Delete torrents files from directory if they are already loaded in qBittorrent"
     )
-    parser_g.add_argument("--torrents-dir", type=is_dir, help="Directory with torrent files", required=True)
+    parser_g.add_argument("--torrents-dirs", nargs="+", type=is_dir, help="Directory with torrent files", required=True)
     parser_g.add_argument(
         "--data-dirs", nargs="+", type=is_dir, help="Directory to look for torrent data", required=True
     )
