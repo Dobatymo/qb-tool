@@ -2,12 +2,15 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.3.0
     hooks:
+      - id: check-added-large-files
+      - id: check-case-conflict
       - id: check-json
+      - id: check-merge-conflict
+      - id: check-symlinks
       - id: check-toml
       - id: check-yaml
-      - id: check-case-conflict
-      - id: check-added-large-files
       - id: debug-statements
+      - id: detect-private-key
       - id: end-of-file-fixer
       - id: mixed-line-ending
         args: ["--fix=no"]
@@ -39,7 +42,12 @@ repos:
       - id: mypy
         args: ["--install-types", "--non-interactive", "--show-error-codes"]
         additional_dependencies:
-          - genutility>=0.0.71
-          - qbittorrent-api
-          - bencodepy
-          - requests
+          - appdirs==1.4.4
+          - bencode.py==4.0.0
+          - genutility==0.0.85
+          - qbittorrent-api==2022.5.32
+          - requests==2.28.0
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.2.0
+    hooks:
+      - id: detect-secrets

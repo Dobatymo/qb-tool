@@ -1,4 +1,5 @@
-bencodepy
+appdirs
+bencode.py
 genutility
 qbittorrent-api
 requests
