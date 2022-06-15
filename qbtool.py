@@ -263,7 +263,7 @@ def _build_inverse_tree(basepath: Path) -> InversePathTree:
 
 
 def _load_torrent_info(path: str) -> List[Dict[str, Any]]:
-    info = read_torrent_info_dict(path)
+    info = read_torrent_info_dict(path, normalize_string_fields=True)
 
     if "files" not in info:
         return [{"path": Path(info["name"]), "size": info["length"]}]
@@ -310,12 +310,19 @@ def find_torrents(client, args) -> None:
                     path_matches[path].append(size)
 
             meta_matches = []
+            partial_matches = []
             for path, sizes in path_matches.items():
                 if sizes == all_sizes:
                     meta_matches.append(path)
+                else:
+                    partial_matches.append(path)
 
             if len(meta_matches) == 0:
-                logging.debug("Found path, but no size matches for %s", info)
+                if len(info) == 1:
+                    logging.debug("Found path, but no size matches for <%s>: %s", torrent_file, info[0]["path"])
+                elif partial_matches:
+                    logging.info("Found partial match for <%s>: %s", torrent_file, partial_matches)
+
             elif len(meta_matches) == 1:
                 _meta_matches = meta_matches[0]
 
