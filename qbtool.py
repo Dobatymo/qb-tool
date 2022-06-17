@@ -2,15 +2,16 @@ import logging
 import re
 from argparse import ArgumentParser
 from collections import defaultdict
+from itertools import chain
 from os import fspath
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Collection, Dict, Iterable, Iterator, List, Tuple
 
 import bencodepy
 import qbittorrentapi
 import requests
 from appdirs import user_data_dir
-from genutility.args import is_dir
+from genutility.args import is_dir, is_file
 from genutility.filesystem import scandir_rec_simple
 from genutility.iter import batch, retrier
 from genutility.json import json_lines, read_json
@@ -24,6 +25,7 @@ AUTHOR = "Dobatymo"
 DEFAULT_CONFIG = {
     "category-name": "_Unregistered",
     "host": "localhost:8080",
+    "scrapes-file": "scrapes.jl",
 }
 
 
@@ -133,9 +135,9 @@ def torrent_exists(client, hash: str) -> bool:
 def remove_loaded_torrents(client, args) -> None:
 
     if args.recursive:
-        it = args.path.rglob("*.torrent")
+        it = chain.from_iterable(p.rglob("*.torrent") for p in args.path)
     else:
-        it = args.path.glob("*.torrent")
+        it = chain.from_iterable(p.glob("*.torrent") for p in args.path)
 
     num_remove = 0
     num_keep = 0
@@ -153,7 +155,10 @@ def remove_loaded_torrents(client, args) -> None:
             logging.info("Removed %s <%s>", hash, path)
             num_remove += 1
             if args.do_remove:
-                path.unlink()
+                try:
+                    path.unlink()
+                except PermissionError as e:
+                    logging.error("Failed to remove %s: %s", path, e)
         else:
             num_keep += 1
             logging.debug("Keep %s <%s>", hash, path)
@@ -183,7 +188,7 @@ def move_by_availability(client, args) -> None:
     import pandas as pd
 
     tuples = []
-    with json_lines.from_path("scrapes.jl", "rt") as jl:
+    with json_lines.from_path(args.scrapes_file, "rt") as jl:
         for tracker_url, hash, info in jl:
             try:
                 tuples.append((tracker_url, hash, info["complete"]))
@@ -197,35 +202,50 @@ def move_by_availability(client, args) -> None:
     print(df[df["complete"] == 1])
 
 
-def move_by_rename(client, args) -> None:
+def _move_by_rename(
+    torrents_info: Iterable[qbittorrentapi.AttrDict],
+    src: str,
+    dest: str,
+    regex: bool,
+    match_start: bool,
+    match_end: bool,
+    case_sensitive: bool,
+) -> Iterator[Tuple[str, qbittorrentapi.AttrDict]]:
+    flags = re.IGNORECASE if not case_sensitive else 0
 
-    flags = re.IGNORECASE if not args.case_sensitive else 0
+    if not regex:
+        src = re.escape(src)
+        dest = dest.replace("\\", "\\\\")
 
-    if args.regex:
-        src = args.src
-        dest = args.dest
-    else:
-        src = re.escape(args.src)
-        dest = args.dest.replace("\\", "\\\\")
-
-    if args.match_start:
+    if match_start:
         src = f"^{src}"
 
-    if args.match_end:
+    if match_end:
         src = f"{src}$"
 
-    src = re.compile(src, flags)
+    src_p = re.compile(src, flags)
 
-    for torrent in client.torrents_info():
-        assert torrent.content_path.startswith(torrent.save_path)
+    for torrent in torrents_info:
+        if not torrent.content_path.startswith(torrent.save_path):  # file might already be queued for moving
+            logging.error(f"{torrent.content_path} doesn't start with {torrent.save_path}")
+            continue
 
-        new, n = src.subn(dest, torrent.save_path)
+        new, n = src_p.subn(dest, torrent.save_path)
         renamed = n > 0
 
         if renamed:
-            print(f"Moving `{torrent.name}` from <{torrent.save_path}> to <{new}>.")
-            if args.do_move:
-                client.torrents_set_location(new, torrent.hash)
+            yield new, torrent
+
+
+def move_by_rename(client, args) -> None:
+    torrents_info = client.torrents_info()
+
+    for new_location, torrent in _move_by_rename(
+        torrents_info, args.src, args.dest, args.regex, args.match_start, args.match_end, args.case_sensitive
+    ):
+        print(f"Moving `{torrent.name}` from <{torrent.save_path}> to <{new_location}>.")
+        if args.do_move:
+            client.torrents_set_location(new_location, torrent.hash)
 
 
 class InversePathTree:
@@ -262,13 +282,16 @@ def _build_inverse_tree(basepath: Path) -> InversePathTree:
     return tree
 
 
-def _load_torrent_info(path: str) -> List[Dict[str, Any]]:
+def _load_torrent_info(path: str, ignore_top_level_dir: bool) -> List[Dict[str, Any]]:
     info = read_torrent_info_dict(path, normalize_string_fields=True)
 
     if "files" not in info:
         return [{"path": Path(info["name"]), "size": info["length"]}]
     else:
-        return [{"path": Path(info["name"], *file["path"]), "size": file["length"]} for file in info["files"]]
+        if ignore_top_level_dir:
+            return [{"path": Path(*file["path"]), "size": file["length"]} for file in info["files"]]
+        else:
+            return [{"path": Path(info["name"], *file["path"]), "size": file["length"]} for file in info["files"]]
 
 
 def check_exists(_meta_matches: Path, info: List[Dict[str, Any]]) -> bool:
@@ -281,22 +304,30 @@ def check_exists(_meta_matches: Path, info: List[Dict[str, Any]]) -> bool:
     return True
 
 
-def find_torrents(client, args) -> None:
-    infos: Dict[str, List[Dict[str, Any]]] = {}
-    for dir in args.torrents_dirs:
+def recstr(obj: Any):
+
+    if isinstance(obj, list):
+        return f"[{', '.join(map(recstr, obj))}]"
+    else:
+        return str(obj)
+
+
+def _find_torrents(
+    torrents_dirs: Collection[Path], data_dirs: Collection[Path], ignore_top_level_dir: bool
+) -> Iterator[Tuple[Path, Path]]:
+    infos: Dict[Path, List[Dict[str, Any]]] = {}
+    for dir in torrents_dirs:
         for file in dir.rglob("*.torrent"):
             try:
-                infos[fspath(file)] = _load_torrent_info(file)
+                infos[file] = _load_torrent_info(fspath(file), ignore_top_level_dir)
             except TypeError as e:
                 logging.error("Skipping %s: %s", file, e)
 
-    dirs = ", ".join(f"<{dir}>" for dir in args.torrents_dirs)
+    dirs = ", ".join(f"<{dir}>" for dir in torrents_dirs)
     logging.info("Loaded %s torrents from %s", len(infos), dirs)
 
-    for dir in args.data_dirs:
+    for dir in data_dirs:
         invtree = _build_inverse_tree(dir)
-        num_add_try = 0
-        num_add_fail = 0
         logging.info("Built filesystem tree with %s files from <%s>", len(invtree), dir)
 
         # stage 1: match paths and sizes
@@ -304,9 +335,9 @@ def find_torrents(client, args) -> None:
         for torrent_file, info in infos.items():
 
             path_matches = defaultdict(list)
-            all_sizes = [file["size"] for file in info]
-            for file in info:
-                for path, size in invtree.find(file["path"]).items():
+            all_sizes = [_file["size"] for _file in info]
+            for _file in info:
+                for path, size in invtree.find(_file["path"]).items():
                     path_matches[path].append(size)
 
             meta_matches = []
@@ -321,7 +352,12 @@ def find_torrents(client, args) -> None:
                 if len(info) == 1:
                     logging.debug("Found path, but no size matches for <%s>: %s", torrent_file, info[0]["path"])
                 elif partial_matches:
-                    logging.info("Found partial match for <%s>: %s", torrent_file, partial_matches)
+                    logging.info(
+                        "Found %d partial matches for <%s>: %s",
+                        len(partial_matches),
+                        torrent_file,
+                        recstr(partial_matches),
+                    )
 
             elif len(meta_matches) == 1:
                 _meta_matches = meta_matches[0]
@@ -329,24 +365,42 @@ def find_torrents(client, args) -> None:
                 if not check_exists(_meta_matches, info):
                     continue
 
-                print(f"Found possible match for {torrent_file}: {_meta_matches}")
-                num_add_try += 1
-                if args.do_add:
-                    result = client.torrents_add(
-                        torrent_files=torrent_file,
-                        save_path=fspath(_meta_matches),
-                        is_skip_checking=False,
-                        is_paused=False,
-                    )
-                    if result == "Fails.":
-                        logging.error("Failed to add %s", torrent_file)
-                        num_add_fail += 1
-            else:
-                logging.warning("Found multiple possible matches for %s: %s", torrent_file, _meta_matches)
+                yield torrent_file, _meta_matches
 
-        print(f"Tried to add {num_add_try} torrents, {num_add_fail} failed")
+            else:
+                logging.warning(
+                    "Found %d possible matches for %s: %s", len(meta_matches), torrent_file, recstr(meta_matches)
+                )
 
         # stage 2: match size and hashes (for renames)
+
+
+def find_torrents(client, args) -> None:
+    num_add_try = 0
+    num_add_fail = 0
+
+    for torrent_file, match in _find_torrents(args.torrents_dirs, args.data_dirs, args.ignore_top_level_dir):
+        print(f"Found possible match for {torrent_file}: {match}")
+        num_add_try += 1
+        if args.do_add:
+
+            if args.ignore_top_level_dir:
+                content_layout = "NoSubfolder"
+            else:
+                content_layout = "Original"
+
+            result = client.torrents_add(
+                torrent_files=fspath(torrent_file),
+                save_path=fspath(match),
+                is_skip_checking=False,
+                is_paused=False,
+                content_layout=content_layout,
+            )
+            if result == "Fails.":
+                logging.error("Failed to add %s", torrent_file)
+                num_add_fail += 1
+
+    print(f"Tried to add {num_add_try} torrents, {num_add_fail} failed")
 
 
 def get_config():
@@ -390,13 +444,16 @@ def main():
 
     parser_c = subparsers.add_parser("scrape-loaded", help="Scrape all torrents and output results to file")
     parser_c.add_argument("path", type=is_dir, help="Input directory")
-    parser_c.add_argument("--out", default=Path("out.jl"))
+    parser_c.add_argument("--out", default=Path(conf["scrapes-file"]), help="Path to write scraped file info to")
     parser_c.set_defaults(func=scrape_loaded)
 
     parser_d = subparsers.add_parser(
-        "move-by-availability", help="Moves torrents around on the harddrive based on number of seeders"
+        "move-by-availability", help="Moves torrents around on the harddrive based on number of seeders. NOT FULLY IMPLEMENTED YET!"
     )
     parser_d.add_argument("path", type=is_dir, help="Input directory")
+    parser_d.add_argument(
+        "--scrapes-file", type=is_file, default=Path(conf["scrapes-file"]), help="Created by the scrape-loaded command."
+    )
     parser_d.add_argument(
         "--do-move", action="store_true", help="Actually move them, otherwise the moves are only printed"
     )
@@ -405,7 +462,7 @@ def main():
     parser_e = subparsers.add_parser(
         "remove-loaded-torrents", help="Delete torrents files from directory if they are already loaded in qBittorrent"
     )
-    parser_e.add_argument("path", type=is_dir, help="Input directory")
+    parser_e.add_argument("path", nargs="+", type=is_dir, help="Input directory")
     parser_e.add_argument("--do-remove", action="store_true")
     parser_e.set_defaults(func=remove_loaded_torrents)
 
@@ -434,6 +491,11 @@ def main():
         "--do-add",
         action="store_true",
         help="Actually add the torrents to qBittorrent, otherwise just print found ones",
+    )
+    parser_g.add_argument(
+        "--ignore-top-level-dir",
+        action="store_true",
+        help="Ignore the name of the top level dir. This will help to find torrents where no sub-folder was created.",
     )
     parser_g.set_defaults(func=find_torrents)
 
