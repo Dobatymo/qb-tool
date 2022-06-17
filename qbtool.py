@@ -2,6 +2,7 @@ import logging
 import re
 from argparse import ArgumentParser
 from collections import defaultdict
+from functools import partial
 from itertools import chain
 from os import fspath
 from pathlib import Path
@@ -415,6 +416,11 @@ def get_config():
     return conf
 
 
+def full_help(client, args, parsers):
+    for parser in parsers:
+        print(parser.format_help())
+
+
 def main():
     conf = get_config()
 
@@ -448,7 +454,8 @@ def main():
     parser_c.set_defaults(func=scrape_loaded)
 
     parser_d = subparsers.add_parser(
-        "move-by-availability", help="Moves torrents around on the harddrive based on number of seeders. NOT FULLY IMPLEMENTED YET!"
+        "move-by-availability",
+        help="Moves torrents around on the harddrive based on number of seeders. NOT FULLY IMPLEMENTED YET!",
     )
     parser_d.add_argument("path", type=is_dir, help="Input directory")
     parser_d.add_argument(
@@ -498,6 +505,10 @@ def main():
         help="Ignore the name of the top level dir. This will help to find torrents where no sub-folder was created.",
     )
     parser_g.set_defaults(func=find_torrents)
+
+    all_parsers = [parser, parser_a, parser_b, parser_c, parser_d, parser_e, parser_f, parser_g]
+    parser_h = subparsers.add_parser("full-help", help="Show full help, including subparsers")
+    parser_h.set_defaults(func=partial(full_help, parsers=all_parsers))
 
     args = parser.parse_args()
 
