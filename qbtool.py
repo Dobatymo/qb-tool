@@ -4,6 +4,7 @@ from argparse import ArgumentParser
 from collections import defaultdict
 from functools import partial
 from itertools import chain
+from operator import itemgetter
 from os import fspath
 from pathlib import Path
 from typing import Any, Collection, Dict, Iterable, Iterator, List, Tuple
@@ -273,12 +274,11 @@ class InversePathTree:
         return self.trie.calc_leaves()
 
 
-def _build_inverse_tree(basepath: Path) -> InversePathTree:
+def _build_inverse_tree(basepath: Path, follow_symlinks: bool) -> InversePathTree:
 
     tree = InversePathTree()
-    for entry in scandir_rec_simple(fspath(basepath)):
-        if entry.is_file():
-            tree.add(Path(entry.path), entry.stat().st_size)
+    for entry in scandir_rec_simple(fspath(basepath), dirs=False, follow_symlinks=follow_symlinks):
+        tree.add(Path(entry.path), entry.stat().st_size)
 
     return tree
 
@@ -314,7 +314,7 @@ def recstr(obj: Any):
 
 
 def _find_torrents(
-    torrents_dirs: Collection[Path], data_dirs: Collection[Path], ignore_top_level_dir: bool
+    torrents_dirs: Collection[Path], data_dirs: Collection[Path], ignore_top_level_dir: bool, follow_symlinks: bool
 ) -> Iterator[Tuple[Path, Path]]:
     infos: Dict[Path, List[Dict[str, Any]]] = {}
     for dir in torrents_dirs:
@@ -328,7 +328,7 @@ def _find_torrents(
     logging.info("Loaded %s torrents from %s", len(infos), dirs)
 
     for dir in data_dirs:
-        invtree = _build_inverse_tree(dir)
+        invtree = _build_inverse_tree(dir, follow_symlinks)
         logging.info("Built filesystem tree with %s files from <%s>", len(invtree), dir)
 
         # stage 1: match paths and sizes
@@ -342,22 +342,42 @@ def _find_torrents(
                     path_matches[path].append(size)
 
             meta_matches = []
-            partial_matches = []
+            partial_matches_sizes = []
+            partial_matches_paths = []
             for path, sizes in path_matches.items():
                 if sizes == all_sizes:
                     meta_matches.append(path)
+                elif len(sizes) == len(all_sizes):
+                    num_same = sum(1 for s1, s2 in zip(sizes, all_sizes) if s1 == s2)
+                    partial_matches_sizes.append((path, num_same))
                 else:
-                    partial_matches.append(path)
+                    partial_matches_paths.append((path, len(sizes)))
 
             if len(meta_matches) == 0:
+
+                num_partial_matches = len(partial_matches_sizes) + len(partial_matches_paths)
+
                 if len(info) == 1:
                     logging.debug("Found path, but no size matches for <%s>: %s", torrent_file, info[0]["path"])
-                elif partial_matches:
+                elif partial_matches_sizes:
+                    best_path, best_num = max(partial_matches_sizes, key=itemgetter(1))
                     logging.info(
-                        "Found %d partial matches for <%s>: %s",
-                        len(partial_matches),
+                        "Found %d partial matches for <%s>. <%s> matches %d out of %d file sizes and all paths.",
+                        num_partial_matches,
                         torrent_file,
-                        recstr(partial_matches),
+                        best_path,
+                        best_num,
+                        len(all_sizes),
+                    )
+                elif partial_matches_paths:
+                    best_path, best_num = max(partial_matches_paths, key=itemgetter(1))
+                    logging.info(
+                        "Found %d partial matches for <%s>. <%s> matches %d out of %d file paths.",
+                        num_partial_matches,
+                        torrent_file,
+                        best_path,
+                        best_num,
+                        len(all_sizes),
                     )
 
             elif len(meta_matches) == 1:
@@ -380,7 +400,9 @@ def find_torrents(client, args) -> None:
     num_add_try = 0
     num_add_fail = 0
 
-    for torrent_file, match in _find_torrents(args.torrents_dirs, args.data_dirs, args.ignore_top_level_dir):
+    for torrent_file, match in _find_torrents(
+        args.torrents_dirs, args.data_dirs, args.ignore_top_level_dir, args.follow_symlinks
+    ):
         print(f"Found possible match for {torrent_file}: {match}")
         num_add_try += 1
         if args.do_add:
@@ -504,6 +526,12 @@ def main():
         action="store_true",
         help="Ignore the name of the top level dir. This will help to find torrents where no sub-folder was created.",
     )
+    parser_g.add_argument(
+        "--follow-symlinks",
+        action="store_true",
+        help="Follow symlinks (and junctions)",
+    )
+
     parser_g.set_defaults(func=find_torrents)
 
     all_parsers = [parser, parser_a, parser_b, parser_c, parser_d, parser_e, parser_f, parser_g]
