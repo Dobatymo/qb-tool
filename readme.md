@@ -4,7 +4,7 @@
 
 ```
 usage: qbtool.py [-h] [--host HOST] [--username USERNAME]
-                 [--password PASSWORD] [--recursive] [--verbose]
+                 [--password PASSWORD] [--verbose]
                  {categorize-failed-private,list-paused-private,scrape-loaded,move-by-availability,remove-loaded-torrents,move-by-rename,find-torrents,full-help}
                  ...
 
@@ -25,8 +25,8 @@ positional arguments:
                         Delete torrents files from directory if they are
                         already loaded in qBittorrent
     move-by-rename      b help
-    find-torrents       Delete torrents files from directory if they are
-                        already loaded in qBittorrent
+    find-torrents       Load torrent files from directory, find the associated
+                        files on the harddrive and load the torrents.
     full-help           Show full help, including subparsers
 
 optional arguments:
@@ -34,7 +34,6 @@ optional arguments:
   --host HOST           qBittorrent web interface host and port
   --username USERNAME   qBittorrent web interface username
   --password PASSWORD   qBittorrent web interface password
-  --recursive
   --verbose             Show debug output
 
 usage: qbtool.py categorize-failed-private [-h] [--do-move]
@@ -78,14 +77,16 @@ optional arguments:
   --do-move             Actually move them, otherwise the moves are only
                         printed
 
-usage: qbtool.py remove-loaded-torrents [-h] [--do-remove] path [path ...]
+usage: qbtool.py remove-loaded-torrents [-h] [--do-remove] [--recursive]
+                                        path [path ...]
 
 positional arguments:
   path         Input directory
 
 optional arguments:
   -h, --help   show this help message and exit
-  --do-remove
+  --do-remove  Remove the file from disk
+  --recursive  Scan for torrent files recursively.
 
 usage: qbtool.py move-by-rename [-h] --src SRC --dest DEST [--do-move]
                                 [--case-sensitive] [--regex] [--match-start]
@@ -104,7 +105,8 @@ optional arguments:
 usage: qbtool.py find-torrents [-h] --torrents-dirs TORRENTS_DIRS
                                [TORRENTS_DIRS ...] --data-dirs DATA_DIRS
                                [DATA_DIRS ...] [--do-add]
-                               [--ignore-top-level-dir]
+                               [--ignore-top-level-dir] [--follow-symlinks]
+                               [--recursive]
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -117,6 +119,8 @@ optional arguments:
   --ignore-top-level-dir
                         Ignore the name of the top level dir. This will help
                         to find torrents where no sub-folder was created.
+  --follow-symlinks     Follow symlinks (and junctions)
+  --recursive           Scan for torrent files recursively.
 
 ```
 

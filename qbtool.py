@@ -1,28 +1,18 @@
 import logging
 import re
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from collections import defaultdict
-from functools import partial
-from itertools import chain
-from operator import itemgetter
 from os import fspath
 from pathlib import Path
-from typing import Any, Collection, Dict, Iterable, Iterator, List, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Tuple
 
 import bencodepy
 import qbittorrentapi
-import requests
-from appdirs import user_data_dir
 from genutility.args import is_dir, is_file
-from genutility.filesystem import scandir_rec_simple
-from genutility.iter import batch, retrier
 from genutility.json import json_lines, read_json
-from genutility.time import TakeAtleast
-from genutility.torrent import ParseError, get_torrent_hash, read_torrent_info_dict, scrape
-from genutility.tree import SequenceTree
+from genutility.torrent import get_torrent_hash
 
-APP_NAME = "qb-tool"
-AUTHOR = "Dobatymo"
+import common
 
 DEFAULT_CONFIG = {
     "category-name": "_Unregistered",
@@ -30,8 +20,16 @@ DEFAULT_CONFIG = {
     "scrapes-file": "scrapes.jl",
 }
 
+filtermap = {
+    "paused": ("pausedDL", "pausedUP"),
+    "completed": ("uploading", "stalledUP", "pausedUP", "forcedUP"),
+    "errored": {"missingFiles"},
+    "stalled": {"stalledUP", "stalledDL"},
+    "downloading": {"downloading", "pausedDL", "forcedDL"},
+}
 
-def get_private_torrents(client, **kwargs) -> Iterator[Tuple[Any, List[dict]]]:
+
+def get_private_torrents(client: qbittorrentapi.Client, **kwargs) -> Iterator[Tuple[Any, List[dict]]]:
     for torrent in client.torrents_info(**kwargs):
         trackers = client.torrents_trackers(torrent.hash)
         assert trackers[0]["url"] == "** [DHT] **"
@@ -43,7 +41,7 @@ def get_private_torrents(client, **kwargs) -> Iterator[Tuple[Any, List[dict]]]:
             yield torrent, trackers[3:]
 
 
-def get_bad_torrents(client) -> Iterator[Dict[str, Any]]:
+def get_bad_torrents(client: qbittorrentapi.Client) -> Iterator[Dict[str, Any]]:
     for torrent, trackers in get_private_torrents(client, filter="seeding"):
         for tracker in trackers:
             if tracker["status"] == 4:
@@ -54,20 +52,26 @@ def get_bad_torrents(client) -> Iterator[Dict[str, Any]]:
                 }
 
 
-def categorize_private_with_failed_trackers(client, cat_name: str, do_move: bool):
+def paused_private(client: qbittorrentapi.Client) -> Iterator[Any]:
+    for torrent, trackers in get_private_torrents(client, filter="paused"):
+        if torrent.state == "pausedUP":
+            yield torrent
+
+
+def categorize_private_with_failed_trackers(client: qbittorrentapi.Client, args: Namespace):
     new = {t["hash"]: t["name"] for t in get_bad_torrents(client)}
-    old = {t["hash"]: t["name"] for t in client.torrents_info(category=cat_name)}
+    old = {t["hash"]: t["name"] for t in client.torrents_info(category=args.category_name)}
 
     add = new.keys() - old.keys()
     remove = old.keys() - new.keys()
 
-    if do_move:
+    if args.do_move:
         try:
-            client.torrents_create_category(cat_name)
+            client.torrents_create_category(args.category_name)
         except qbittorrentapi.exceptions.Conflict409Error:
             pass  # ignore existing categories
 
-        client.torrents_set_category(cat_name, add)
+        client.torrents_set_category(args.category_name, add)
         client.torrents_set_category("", remove)
     else:
         for hash_ in add:
@@ -75,57 +79,10 @@ def categorize_private_with_failed_trackers(client, cat_name: str, do_move: bool
         for hash_ in remove:
             print(f"Remove {hash_} {old[hash_]}")
 
-    return len(new), len(add), len(remove)
+    print(f"Total: {len(new)}, add: {len(add)}, remove: {len(remove)}")
 
 
-def paused_private(client) -> Iterator[Any]:
-    for torrent, trackers in get_private_torrents(client, filter="paused"):
-        if torrent.state == "pausedUP":
-            yield torrent
-
-
-def scrape_all(client, batchsize: int = 50, delay: float = 5) -> Iterator[Tuple[str, str, Any]]:
-    """Larger batch sizes than 50 lead to issues with many trackers"""
-
-    all = defaultdict(set)
-    for torrent, trackers in get_private_torrents(client):
-        all[torrent["tracker"]].add(torrent.hash)
-
-    for tracker_url, hashes in all.items():
-
-        if not tracker_url:
-            logging.warning("Could not find working tracker for: %s", hashes)
-            continue
-
-        try:
-            for hash_batch in batch(hashes, batchsize, list):
-                for _ in retrier(60, attempts=3):
-                    try:
-                        with TakeAtleast(delay):
-                            for hash, info in scrape(tracker_url, hash_batch).items():
-                                yield tracker_url, hash, info
-                        break
-                    except requests.ConnectionError as e:
-                        logging.warning("%s (%s)", e, tracker_url)
-                else:
-                    logging.error("Skipping remaining hashes for %s", tracker_url)
-                    break
-        except ValueError as e:
-            logging.warning("%s (%s)", e, tracker_url)
-        except ParseError as e:
-            logging.error("%s (%s): %s", e, tracker_url, e.data)
-
-
-filtermap = {
-    "paused": ("pausedDL", "pausedUP"),
-    "completed": ("uploading", "stalledUP", "pausedUP", "forcedUP"),
-    "errored": {"missingFiles"},
-    "stalled": {"stalledUP", "stalledDL"},
-    "downloading": {"downloading", "pausedDL", "forcedDL"},
-}
-
-
-def torrent_exists(client, hash: str) -> bool:
+def torrent_exists(client: qbittorrentapi.Client, hash: str) -> bool:
 
     try:
         client.torrents_properties(hash)
@@ -134,17 +91,12 @@ def torrent_exists(client, hash: str) -> bool:
         return False
 
 
-def remove_loaded_torrents(client, args) -> None:
-
-    if args.recursive:
-        it = chain.from_iterable(p.rglob("*.torrent") for p in args.path)
-    else:
-        it = chain.from_iterable(p.glob("*.torrent") for p in args.path)
+def remove_loaded_torrents(client: qbittorrentapi.Client, args: Namespace) -> None:
 
     num_remove = 0
     num_keep = 0
 
-    for path in it:
+    for path in common._iter_torrent_files(args.path, args.recursive):
         try:
             hash = get_torrent_hash(fspath(path))
         except bencodepy.exceptions.BencodeDecodeError:
@@ -168,24 +120,26 @@ def remove_loaded_torrents(client, args) -> None:
     print(f"Remove {num_remove} files, keep {num_keep} files")
 
 
-def categorize_failed_private(client, args) -> None:
-    total, add, remove = categorize_private_with_failed_trackers(client, args.category_name, args.do_move)
-    print(f"Total: {total}, add: {add}, remove: {remove}")
-
-
-def list_paused_private(client, args) -> None:
+def list_paused_private(client: qbittorrentapi.Client, args: Namespace) -> None:
     torrents = list(paused_private(client))
     for torrent in torrents:
         print(torrent.hash, torrent.name)
 
 
-def scrape_loaded(client, args) -> None:
+def scrape_loaded(client: qbittorrentapi.Client, args: Namespace) -> None:
+    batchsize = 50
+    delay = 5.0
+
+    all = defaultdict(set)
+    for torrent, trackers in get_private_torrents(client):
+        all[torrent["tracker"]].add(torrent.hash)
+
     with json_lines.from_path(args.out, "wt") as fw:
-        for obj in scrape_all(client):
+        for obj in common._scrape_all(all, batchsize, delay):
             fw.write(obj)
 
 
-def move_by_availability(client, args) -> None:
+def move_by_availability(client: qbittorrentapi.Client, args: Namespace) -> None:
 
     import pandas as pd
 
@@ -239,7 +193,7 @@ def _move_by_rename(
             yield new, torrent
 
 
-def move_by_rename(client, args) -> None:
+def move_by_rename(client: qbittorrentapi.Client, args: Namespace) -> None:
     torrents_info = client.torrents_info()
 
     for new_location, torrent in _move_by_rename(
@@ -250,158 +204,12 @@ def move_by_rename(client, args) -> None:
             client.torrents_set_location(new_location, torrent.hash)
 
 
-class InversePathTree:
-
-    endkey = "\0"
-
-    def __init__(self):
-        self.trie = SequenceTree(endkey=self.endkey)
-
-    def add(self, path: Path, size: int) -> None:
-        self.trie[reversed(path.parts)] = size
-
-    def find(self, path: Path) -> Dict[Path, int]:
-        try:
-            node = self.trie.get_node(reversed(path.parts))
-        except KeyError:
-            return {}
-
-        paths = {Path(*reversed(parts)): size for parts, size in self.trie.iter_node(node)}
-
-        return paths
-
-    def __len__(self) -> int:
-        return self.trie.calc_leaves()
-
-
-def _build_inverse_tree(basepath: Path, follow_symlinks: bool) -> InversePathTree:
-
-    tree = InversePathTree()
-    for entry in scandir_rec_simple(fspath(basepath), dirs=False, follow_symlinks=follow_symlinks):
-        tree.add(Path(entry.path), entry.stat().st_size)
-
-    return tree
-
-
-def _load_torrent_info(path: str, ignore_top_level_dir: bool) -> List[Dict[str, Any]]:
-    info = read_torrent_info_dict(path, normalize_string_fields=True)
-
-    if "files" not in info:
-        return [{"path": Path(info["name"]), "size": info["length"]}]
-    else:
-        if ignore_top_level_dir:
-            return [{"path": Path(*file["path"]), "size": file["length"]} for file in info["files"]]
-        else:
-            return [{"path": Path(info["name"], *file["path"]), "size": file["length"]} for file in info["files"]]
-
-
-def check_exists(_meta_matches: Path, info: List[Dict[str, Any]]) -> bool:
-    for file in info:
-        full_path = _meta_matches / file["path"]
-        if not full_path.exists():
-            logging.error("File does not exist: <%s>", full_path)
-            return False
-
-    return True
-
-
-def recstr(obj: Any):
-
-    if isinstance(obj, list):
-        return f"[{', '.join(map(recstr, obj))}]"
-    else:
-        return str(obj)
-
-
-def _find_torrents(
-    torrents_dirs: Collection[Path], data_dirs: Collection[Path], ignore_top_level_dir: bool, follow_symlinks: bool
-) -> Iterator[Tuple[Path, Path]]:
-    infos: Dict[Path, List[Dict[str, Any]]] = {}
-    for dir in torrents_dirs:
-        for file in dir.rglob("*.torrent"):
-            try:
-                infos[file] = _load_torrent_info(fspath(file), ignore_top_level_dir)
-            except TypeError as e:
-                logging.error("Skipping %s: %s", file, e)
-
-    dirs = ", ".join(f"<{dir}>" for dir in torrents_dirs)
-    logging.info("Loaded %s torrents from %s", len(infos), dirs)
-
-    for dir in data_dirs:
-        invtree = _build_inverse_tree(dir, follow_symlinks)
-        logging.info("Built filesystem tree with %s files from <%s>", len(invtree), dir)
-
-        # stage 1: match paths and sizes
-
-        for torrent_file, info in infos.items():
-
-            path_matches = defaultdict(list)
-            all_sizes = [_file["size"] for _file in info]
-            for _file in info:
-                for path, size in invtree.find(_file["path"]).items():
-                    path_matches[path].append(size)
-
-            meta_matches = []
-            partial_matches_sizes = []
-            partial_matches_paths = []
-            for path, sizes in path_matches.items():
-                if sizes == all_sizes:
-                    meta_matches.append(path)
-                elif len(sizes) == len(all_sizes):
-                    num_same = sum(1 for s1, s2 in zip(sizes, all_sizes) if s1 == s2)
-                    partial_matches_sizes.append((path, num_same))
-                else:
-                    partial_matches_paths.append((path, len(sizes)))
-
-            if len(meta_matches) == 0:
-
-                num_partial_matches = len(partial_matches_sizes) + len(partial_matches_paths)
-
-                if len(info) == 1:
-                    logging.debug("Found path, but no size matches for <%s>: %s", torrent_file, info[0]["path"])
-                elif partial_matches_sizes:
-                    best_path, best_num = max(partial_matches_sizes, key=itemgetter(1))
-                    logging.info(
-                        "Found %d partial matches for <%s>. <%s> matches %d out of %d file sizes and all paths.",
-                        num_partial_matches,
-                        torrent_file,
-                        best_path,
-                        best_num,
-                        len(all_sizes),
-                    )
-                elif partial_matches_paths:
-                    best_path, best_num = max(partial_matches_paths, key=itemgetter(1))
-                    logging.info(
-                        "Found %d partial matches for <%s>. <%s> matches %d out of %d file paths.",
-                        num_partial_matches,
-                        torrent_file,
-                        best_path,
-                        best_num,
-                        len(all_sizes),
-                    )
-
-            elif len(meta_matches) == 1:
-                _meta_matches = meta_matches[0]
-
-                if not check_exists(_meta_matches, info):
-                    continue
-
-                yield torrent_file, _meta_matches
-
-            else:
-                logging.warning(
-                    "Found %d possible matches for %s: %s", len(meta_matches), torrent_file, recstr(meta_matches)
-                )
-
-        # stage 2: match size and hashes (for renames)
-
-
-def find_torrents(client, args) -> None:
+def find_torrents(client: qbittorrentapi.Client, args: Namespace) -> None:
     num_add_try = 0
     num_add_fail = 0
 
-    for torrent_file, match in _find_torrents(
-        args.torrents_dirs, args.data_dirs, args.ignore_top_level_dir, args.follow_symlinks
+    for torrent_file, match in common._find_torrents(
+        args.torrents_dirs, args.data_dirs, args.ignore_top_level_dir, args.follow_symlinks, args.recursive
     ):
         print(f"Found possible match for {torrent_file}: {match}")
         num_add_try += 1
@@ -428,9 +236,8 @@ def find_torrents(client, args) -> None:
 
 def get_config():
     conf = DEFAULT_CONFIG
-    config_dir = Path(user_data_dir(APP_NAME, AUTHOR))
     try:
-        file_config = read_json(config_dir / "config.json")
+        file_config = read_json(common.config_dir / "config.json")
         conf.update(file_config)
     except FileNotFoundError:
         pass
@@ -438,9 +245,8 @@ def get_config():
     return conf
 
 
-def full_help(client, args, parsers):
-    for parser in parsers:
-        print(parser.format_help())
+def print_full_help(client: qbittorrentapi.Client, args: Namespace):
+    print("\n".join(common.full_help(args.all_parsers)))
 
 
 def main():
@@ -450,7 +256,6 @@ def main():
     parser.add_argument("--host", default=conf.get("host"), help="qBittorrent web interface host and port")
     parser.add_argument("--username", default=conf.get("username"), help="qBittorrent web interface username")
     parser.add_argument("--password", default=conf.get("password"), help="qBittorrent web interface password")
-    parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--verbose", action="store_true", help="Show debug output")
     subparsers = parser.add_subparsers(dest="action", required=True)
 
@@ -464,7 +269,7 @@ def main():
     parser_a.add_argument(
         "--category-name", default=conf.get("category-name"), help="Name of category to assign torrents to"
     )
-    parser_a.set_defaults(func=categorize_failed_private)
+    parser_a.set_defaults(func=categorize_private_with_failed_trackers)
 
     parser_b = subparsers.add_parser("list-paused-private", help="List all paused private torrents")
     parser_b.add_argument("path", type=is_dir, help="Input directory")
@@ -492,7 +297,12 @@ def main():
         "remove-loaded-torrents", help="Delete torrents files from directory if they are already loaded in qBittorrent"
     )
     parser_e.add_argument("path", nargs="+", type=is_dir, help="Input directory")
-    parser_e.add_argument("--do-remove", action="store_true")
+    parser_e.add_argument("--do-remove", action="store_true", help="Remove the file from disk")
+    parser_e.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Scan for torrent files recursively.",
+    )
     parser_e.set_defaults(func=remove_loaded_torrents)
 
     parser_f = subparsers.add_parser("move-by-rename", help="b help")
@@ -510,7 +320,8 @@ def main():
     parser_f.set_defaults(func=move_by_rename)
 
     parser_g = subparsers.add_parser(
-        "find-torrents", help="Delete torrents files from directory if they are already loaded in qBittorrent"
+        "find-torrents",
+        help="Load torrent files from directory, find the associated files on the harddrive and load the torrents.",
     )
     parser_g.add_argument("--torrents-dirs", nargs="+", type=is_dir, help="Directory with torrent files", required=True)
     parser_g.add_argument(
@@ -531,14 +342,18 @@ def main():
         action="store_true",
         help="Follow symlinks (and junctions)",
     )
-
+    parser_g.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Scan for torrent files recursively.",
+    )
     parser_g.set_defaults(func=find_torrents)
 
-    all_parsers = [parser, parser_a, parser_b, parser_c, parser_d, parser_e, parser_f, parser_g]
-    parser_h = subparsers.add_parser("full-help", help="Show full help, including subparsers")
-    parser_h.set_defaults(func=partial(full_help, parsers=all_parsers))
+    parser_help = subparsers.add_parser("full-help", help="Show full help, including subparsers")
+    parser_help.set_defaults(func=print_full_help)
 
     args = parser.parse_args()
+    args.all_parsers = [parser, parser_a, parser_b, parser_c, parser_d, parser_e, parser_f, parser_g]
 
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
