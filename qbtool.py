@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 from argparse import ArgumentParser, Namespace
 from collections import defaultdict
 from os import fspath
@@ -208,10 +209,16 @@ def find_torrents(client: qbittorrentapi.Client, args: Namespace) -> None:
     num_add_try = 0
     num_add_fail = 0
 
-    for torrent_file, match in common._find_torrents(
-        args.torrents_dirs, args.data_dirs, args.ignore_top_level_dir, args.follow_symlinks, args.recursive
+    for torrent_file, infohash, save_path, renamed_files in common._find_torrents(
+        args.torrents_dirs,
+        args.data_dirs,
+        args.ignore_top_level_dir,
+        args.follow_symlinks,
+        args.recursive,
+        set(args.modes),
     ):
-        print(f"Found possible match for {torrent_file}: {match}")
+        print(f"Found possible match for {infohash} {torrent_file}: {save_path}")
+        logging.debug("Renamed files: %s", common.recstr(renamed_files))
         num_add_try += 1
         if args.do_add:
 
@@ -220,18 +227,91 @@ def find_torrents(client: qbittorrentapi.Client, args: Namespace) -> None:
             else:
                 content_layout = "Original"
 
-            result = client.torrents_add(
-                torrent_files=fspath(torrent_file),
-                save_path=fspath(match),
-                is_skip_checking=False,
-                is_paused=False,
-                content_layout=content_layout,
-            )
+            if renamed_files is None:
+                result = client.torrents_add(
+                    torrent_files=fspath(torrent_file),
+                    save_path=fspath(save_path),
+                    is_skip_checking=False,
+                    is_paused=False,
+                    content_layout=content_layout,
+                )
+            else:
+                result = client.torrents_add(
+                    torrent_files=fspath(torrent_file),
+                    save_path=fspath(save_path),
+                    is_skip_checking=False,
+                    is_paused=True,
+                    content_layout=content_layout,
+                )
+                if result == "Ok.":
+                    try:
+                        for old_path, new_path in renamed_files.items():
+                            for i in range(3):
+                                try:
+                                    client.torrents_rename_file(infohash, old_path=old_path, new_path=new_path)
+                                    break
+                                except qbittorrentapi.exceptions.NotFound404Error as e:
+                                    logging.warning(
+                                        "File not found: %s. This should not have happened. Wait and try again.", e
+                                    )
+                                    time.sleep(1)
+                            else:
+                                logging.error(
+                                    "Failed to rename files in torrent <%s>: %s -> %s", torrent_file, old_path, new_path
+                                )
+                                raise RuntimeError("Failed to rename files in torrent")
+                        client.torrents_recheck(infohash)
+                        # client.torrents_resume(infohash)
+                    except qbittorrentapi.exceptions.Conflict409Error as e:
+                        logging.warning("Conflict: %s", e)
+
             if result == "Fails.":
                 logging.error("Failed to add %s", torrent_file)
                 num_add_fail += 1
 
     print(f"Tried to add {num_add_try} torrents, {num_add_fail} failed")
+
+
+def _rename_folders_regex(
+    contents: Iterable[Tuple[dict, dict]], src: str, dest: str, case_sensitive: bool
+) -> Iterator[Tuple[dict, str, str]]:
+    flags = re.IGNORECASE if not case_sensitive else 0
+
+    src_p = re.compile(src, flags)
+
+    for torrent, content in contents:
+        paths = [f["name"] for f in content]
+        folders = list({p.rsplit("/", 1)[0] for p in paths if "/" in p})
+        for folder in folders:
+            new, n = src_p.subn(dest, folder)
+            renamed = n > 0
+
+            if renamed:
+                yield torrent, folder, new
+
+
+def rename_folders_regex(client: qbittorrentapi.Client, args: Namespace) -> None:
+
+    """Possible renaming ops:
+    - any sublevel `top-old/sub1-old/sub2-old` to `top-old/sub1-old/sub2-new`
+    - any sublevel `top-old/sub1-old/sub2-old` to `top-old/sub1-new/sub2-old`
+    - multiple sublevel `top-old/sub1-old/sub2-old` to `top-old/sub1-new/sub2-old`
+    - top directory (even in single-top-dir mode) `top-old/sub1-old/sub2-old` to `top-new/sub1-old/sub2-old`
+    - remove sublevel `top-old/sub1-old/sub2-old` to `top-old/sub1-old_sub2-old`
+    - add sublevel `top-old/sub1-old_sub2-old` to `top-old/sub1-old/sub2-old`
+    Ie, all rename ops on full directory paths should be supported. Ops like `top-old` to `top-new` with sub-dirs are untested.
+    """
+
+    contents = (
+        (torrent, client.torrents_files(torrent["hash"], SIMPLE_RESPONSES=True))
+        for torrent in client.torrents_info(SIMPLE_RESPONSES=True)
+    )
+
+    for torrent, old_path, new_path in _rename_folders_regex(contents, args.src, args.dest, args.case_sensitive):
+
+        print(f"Renaming folder of `{torrent['name']}` from <{old_path}> to <{new_path}>.")
+        if args.do_rename:
+            client.torrents_rename_folder(torrent["hash"], old_path, new_path)
 
 
 def get_config():
@@ -305,7 +385,7 @@ def main():
     )
     parser_e.set_defaults(func=remove_loaded_torrents)
 
-    parser_f = subparsers.add_parser("move-by-rename", help="b help")
+    parser_f = subparsers.add_parser("move-by-rename", help="Move torrents where save_path matches src to dest.")
     parser_f.add_argument("--src", type=str, help="Source path pattern", required=True)
     parser_f.add_argument("--dest", type=str, help="Destination path pattern", required=True)
     parser_f.add_argument(
@@ -347,7 +427,24 @@ def main():
         action="store_true",
         help="Scan for torrent files recursively.",
     )
+    parser_g.add_argument(
+        "--modes",
+        choices=("paths-and-sizes", "sizes"),
+        nargs="+",
+        default=["paths-and-sizes"],
+        help="Torrent file matching modes. `paths-and-sizes` finds paths first, then matches all file sizes and then adds the torrents. `sizes` finds files only based on filesize. It tries to add torrents with renamed files. NOTE: `sizes` mode is still unstable!",
+    )
     parser_g.set_defaults(func=find_torrents)
+
+    parser_h = subparsers.add_parser(
+        "rename-folders-regex",
+        help=r"Rename folders within torrents. Example: `py qbtool.py rename-folders-regex --src (.*)\[rarbg\] --dest \1`",
+    )
+    parser_h.add_argument("--src", type=str, help="Source path pattern", required=True)
+    parser_h.add_argument("--dest", type=str, help="Destination path pattern", required=True)
+    parser_h.add_argument("--case-sensitive", action="store_true")
+    parser_h.add_argument("--do-rename", action="store_true", help="Actually do the rename operation.")
+    parser_h.set_defaults(func=rename_folders_regex)
 
     parser_help = subparsers.add_parser("full-help", help="Show full help, including subparsers")
     parser_help.set_defaults(func=print_full_help)

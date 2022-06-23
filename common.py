@@ -4,14 +4,14 @@ from collections import defaultdict
 from operator import itemgetter
 from os import fspath
 from pathlib import Path
-from typing import Any, Collection, Dict, Iterable, Iterator, List, Set, Tuple
+from typing import Any, Collection, Dict, FrozenSet, Iterable, Iterator, List, Optional, Set, Tuple
 
 import requests
 from appdirs import user_data_dir
 from genutility.filesystem import scandir_rec_simple
 from genutility.iter import batch, retrier
 from genutility.time import TakeAtleast
-from genutility.torrent import ParseError, read_torrent_info_dict, scrape
+from genutility.torrent import ParseError, get_torrent_hash, read_torrent_info_dict, scrape
 from genutility.tree import SequenceTree
 
 APP_NAME = "qb-tool"
@@ -46,7 +46,11 @@ class InversePathTree:
 def recstr(obj: Any) -> str:
 
     if isinstance(obj, list):
-        return f"[{', '.join(map(recstr, obj))}]"
+        it: Iterable[str] = map(recstr, obj)
+        return f"[{', '.join(it)}]"
+    elif isinstance(obj, dict):
+        it = (f"{recstr(k)}: {recstr(k)}" for k, v in obj.items())
+        return f"{{{', '.join(it)}}}"
     else:
         return str(obj)
 
@@ -86,6 +90,15 @@ def _build_inverse_tree(basepath: Path, follow_symlinks: bool) -> InversePathTre
     return tree
 
 
+def _build_size_map(basepath: Path, follow_symlinks: bool) -> Dict[int, Set[Path]]:
+
+    sizemap = defaultdict(set)
+    for entry in scandir_rec_simple(fspath(basepath), dirs=False, follow_symlinks=follow_symlinks):
+        sizemap[entry.stat().st_size].add(Path(entry.path))
+
+    return sizemap
+
+
 def check_exists(_meta_matches: Path, info: List[Dict[str, Any]]) -> bool:
     for file in info:
         full_path = _meta_matches / file["path"]
@@ -96,90 +109,132 @@ def check_exists(_meta_matches: Path, info: List[Dict[str, Any]]) -> bool:
     return True
 
 
+def _get_unique_paths(sizemap: Dict[int, Set[Path]], all_sizes: Collection[int]):
+    unique_paths = []
+    try:
+        for size in all_sizes:
+            paths = sizemap[size]
+            if len(paths) == 1:
+                unique_paths.append(paths.pop())
+            else:
+                return None
+    except KeyError:
+        return None
+
+    return unique_paths
+
+
 def _find_torrents(
     torrents_dirs: Collection[Path],
     data_dirs: Collection[Path],
-    ignore_top_level_dir: bool,
-    follow_symlinks: bool,
-    recursive: bool,
-) -> Iterator[Tuple[Path, Path]]:
-    infos: Dict[Path, List[Dict[str, Any]]] = {}
+    ignore_top_level_dir: bool = False,
+    follow_symlinks: bool = False,
+    recursive: bool = True,
+    modes: FrozenSet[str] = frozenset(),
+) -> Iterator[Tuple[Path, str, Path, Optional[Dict[Path, Path]]]]:
+    infos: Dict[Path, Tuple[str, List[Dict[str, Any]]]] = {}
     for file in _iter_torrent_files(torrents_dirs, recursive):
         try:
-            infos[file] = _load_torrent_info(fspath(file), ignore_top_level_dir)
+            # fixme: file is read twice from disk
+            hash = get_torrent_hash(fspath(file))
+            files = _load_torrent_info(fspath(file), ignore_top_level_dir)
+            infos[file] = (hash, files)
         except TypeError as e:
             logging.error("Skipping %s: %s", file, e)
+
+    if modes and set(modes) - {"paths-and-sizes", "sizes"}:
+        raise ValueError(f"Invalid modes: {modes}")
 
     dirs = ", ".join(f"<{dir}>" for dir in torrents_dirs)
     logging.info("Loaded %s torrents from %s", len(infos), dirs)
 
     for dir in data_dirs:
-        invtree = _build_inverse_tree(dir, follow_symlinks)
-        logging.info("Built filesystem tree with %s files from <%s>", len(invtree), dir)
+        if not modes or "paths-and-sizes" in modes:
+            # stage 1: match paths and sizes
 
-        # stage 1: match paths and sizes
+            invtree = _build_inverse_tree(dir, follow_symlinks)
+            logging.info("Built filesystem tree with %s files from <%s>", len(invtree), dir)
 
-        for torrent_file, info in infos.items():
+            for torrent_file, (infohash, files_info) in infos.items():
 
-            path_matches = defaultdict(list)
-            all_sizes = [_file["size"] for _file in info]
-            for _file in info:
-                for path, size in invtree.find(_file["path"]).items():
-                    path_matches[path].append(size)
+                path_matches = defaultdict(list)
+                all_sizes = [_file["size"] for _file in files_info]
+                for _file in files_info:
+                    for path, size in invtree.find(_file["path"]).items():
+                        path_matches[path].append(size)
 
-            meta_matches = []
-            partial_matches_sizes = []
-            partial_matches_paths = []
-            for path, sizes in path_matches.items():
-                if sizes == all_sizes:
-                    meta_matches.append(path)
-                elif len(sizes) == len(all_sizes):
-                    num_same = sum(1 for s1, s2 in zip(sizes, all_sizes) if s1 == s2)
-                    partial_matches_sizes.append((path, num_same))
+                meta_matches = []
+                partial_matches_sizes = []
+                partial_matches_paths = []
+                for path, sizes in path_matches.items():
+                    if sizes == all_sizes:
+                        meta_matches.append(path)
+                    elif len(sizes) == len(all_sizes):
+                        num_same = sum(1 for s1, s2 in zip(sizes, all_sizes) if s1 == s2)
+                        partial_matches_sizes.append((path, num_same))
+                    else:
+                        partial_matches_paths.append((path, len(sizes)))
+
+                if len(meta_matches) == 0:
+
+                    num_partial_matches = len(partial_matches_sizes) + len(partial_matches_paths)
+
+                    if len(files_info) == 1:
+                        logging.debug(
+                            "Found path, but no size matches for <%s>: %s", torrent_file, files_info[0]["path"]
+                        )
+                    elif partial_matches_sizes:
+                        best_path, best_num = max(partial_matches_sizes, key=itemgetter(1))
+                        logging.info(
+                            "Found %d partial matches for <%s>. <%s> matches %d out of %d file sizes and all paths.",
+                            num_partial_matches,
+                            torrent_file,
+                            best_path,
+                            best_num,
+                            len(all_sizes),
+                        )
+                    elif partial_matches_paths:
+                        best_path, best_num = max(partial_matches_paths, key=itemgetter(1))
+                        logging.info(
+                            "Found %d partial matches for <%s>. <%s> matches %d out of %d file paths.",
+                            num_partial_matches,
+                            torrent_file,
+                            best_path,
+                            best_num,
+                            len(all_sizes),
+                        )
+
+                elif len(meta_matches) == 1:
+                    _meta_matches = meta_matches[0]
+
+                    if not check_exists(_meta_matches, files_info):
+                        continue
+
+                    yield torrent_file, infohash, _meta_matches, None
+
                 else:
-                    partial_matches_paths.append((path, len(sizes)))
-
-            if len(meta_matches) == 0:
-
-                num_partial_matches = len(partial_matches_sizes) + len(partial_matches_paths)
-
-                if len(info) == 1:
-                    logging.debug("Found path, but no size matches for <%s>: %s", torrent_file, info[0]["path"])
-                elif partial_matches_sizes:
-                    best_path, best_num = max(partial_matches_sizes, key=itemgetter(1))
-                    logging.info(
-                        "Found %d partial matches for <%s>. <%s> matches %d out of %d file sizes and all paths.",
-                        num_partial_matches,
-                        torrent_file,
-                        best_path,
-                        best_num,
-                        len(all_sizes),
-                    )
-                elif partial_matches_paths:
-                    best_path, best_num = max(partial_matches_paths, key=itemgetter(1))
-                    logging.info(
-                        "Found %d partial matches for <%s>. <%s> matches %d out of %d file paths.",
-                        num_partial_matches,
-                        torrent_file,
-                        best_path,
-                        best_num,
-                        len(all_sizes),
+                    logging.warning(
+                        "Found %d possible matches for %s: %s", len(meta_matches), torrent_file, recstr(meta_matches)
                     )
 
-            elif len(meta_matches) == 1:
-                _meta_matches = meta_matches[0]
+        if not modes or "sizes" in modes:
+            # stage 2: match size and hashes (for renames)
 
-                if not check_exists(_meta_matches, info):
+            sizemap = _build_size_map(dir, follow_symlinks)
+            logging.info("Built filesystem size map with %s files from <%s>", len(sizemap), dir)
+
+            import os.path
+
+            for torrent_file, (infohash, files_info) in infos.items():
+                all_sizes = [_file["size"] for _file in files_info]
+                unique_paths = _get_unique_paths(sizemap, all_sizes)
+                if unique_paths is None:
                     continue
+                assert len(all_sizes) == len(unique_paths)
 
-                yield torrent_file, _meta_matches
-
-            else:
-                logging.warning(
-                    "Found %d possible matches for %s: %s", len(meta_matches), torrent_file, recstr(meta_matches)
-                )
-
-        # stage 2: match size and hashes (for renames)
+                save_path = os.path.commonpath(p.parent for p in unique_paths)  # type: ignore [call-overload]
+                renamed_files = {old["path"]: new.relative_to(save_path) for old, new in zip(files_info, unique_paths)}
+                yield torrent_file, infohash, save_path, renamed_files
 
 
 def _scrape_all(tracker_hashes: Dict[str, Set[str]], batchsize: int, delay: float) -> Iterator[Tuple[str, str, Any]]:
