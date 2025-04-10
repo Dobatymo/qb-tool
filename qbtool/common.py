@@ -4,15 +4,15 @@ from collections import defaultdict
 from operator import itemgetter
 from os import fspath
 from pathlib import Path
-from typing import Any, Collection, Dict, FrozenSet, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Any, Collection, Dict, FrozenSet, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 import requests
-from appdirs import user_data_dir
 from genutility.filesystem import scandir_rec_simple
 from genutility.iter import batch, retrier
 from genutility.time import TakeAtleast
 from genutility.torrent import ParseError, get_torrent_hash, read_torrent_info_dict, scrape
 from genutility.tree import SequenceTree
+from platformdirs import user_data_dir
 
 APP_NAME = "qb-tool"
 AUTHOR = "Dobatymo"
@@ -20,7 +20,6 @@ config_dir = Path(user_data_dir(APP_NAME, AUTHOR))
 
 
 class InversePathTree:
-
     endkey = "\0"
 
     def __init__(self) -> None:
@@ -44,7 +43,6 @@ class InversePathTree:
 
 
 def recstr(obj: Any) -> str:
-
     if isinstance(obj, list):
         it: Iterable[str] = map(recstr, obj)
         return f"[{', '.join(it)}]"
@@ -69,7 +67,7 @@ def _iter_torrent_files(dirs: Collection[Path], recursive: bool) -> Iterator[Pat
         yield from globfunc("*.torrent")
 
 
-def _load_torrent_info(path: str, ignore_top_level_dir: bool) -> List[Dict[str, Any]]:
+def _load_torrent_info(path: Path, ignore_top_level_dir: bool) -> List[Dict[str, Any]]:
     info = read_torrent_info_dict(path, normalize_string_fields=True)
 
     if "files" not in info:
@@ -82,7 +80,6 @@ def _load_torrent_info(path: str, ignore_top_level_dir: bool) -> List[Dict[str, 
 
 
 def _build_inverse_tree(basepath: Path, follow_symlinks: bool) -> InversePathTree:
-
     tree = InversePathTree()
     for entry in scandir_rec_simple(fspath(basepath), dirs=False, follow_symlinks=follow_symlinks):
         tree.add(Path(entry.path), entry.stat().st_size)
@@ -91,7 +88,6 @@ def _build_inverse_tree(basepath: Path, follow_symlinks: bool) -> InversePathTre
 
 
 def _build_size_map(basepath: Path, follow_symlinks: bool) -> Dict[int, Set[Path]]:
-
     sizemap = defaultdict(set)
     for entry in scandir_rec_simple(fspath(basepath), dirs=False, follow_symlinks=follow_symlinks):
         sizemap[entry.stat().st_size].add(Path(entry.path))
@@ -130,19 +126,19 @@ def _find_torrents(
     ignore_top_level_dir: bool = False,
     follow_symlinks: bool = False,
     recursive: bool = True,
-    modes: FrozenSet[str] = frozenset(),
+    modes: Union[FrozenSet[str], Set[str]] = frozenset(),
 ) -> Iterator[Tuple[Path, str, Path, Optional[Dict[Path, Path]]]]:
     infos: Dict[Path, Tuple[str, List[Dict[str, Any]]]] = {}
     for file in _iter_torrent_files(torrents_dirs, recursive):
         try:
             # fixme: file is read twice from disk
-            hash = get_torrent_hash(fspath(file))
-            files = _load_torrent_info(fspath(file), ignore_top_level_dir)
+            hash = get_torrent_hash(file)
+            files = _load_torrent_info(file, ignore_top_level_dir)
             infos[file] = (hash, files)
         except TypeError as e:
             logging.error("Skipping %s: %s", file, e)
 
-    if modes and set(modes) - {"paths-and-sizes", "sizes"}:
+    if modes - {"paths-and-sizes", "sizes"}:
         raise ValueError(f"Invalid modes: {modes}")
 
     dirs = ", ".join(f"<{dir}>" for dir in torrents_dirs)
@@ -156,7 +152,6 @@ def _find_torrents(
             logging.info("Built filesystem tree with %s files from <%s>", len(invtree), dir)
 
             for torrent_file, (infohash, files_info) in infos.items():
-
                 path_matches = defaultdict(list)
                 all_sizes = [_file["size"] for _file in files_info]
                 for _file in files_info:
@@ -176,7 +171,6 @@ def _find_torrents(
                         partial_matches_paths.append((path, len(sizes)))
 
                 if len(meta_matches) == 0:
-
                     num_partial_matches = len(partial_matches_sizes) + len(partial_matches_paths)
 
                     if len(files_info) == 1:
@@ -232,14 +226,13 @@ def _find_torrents(
                     continue
                 assert len(all_sizes) == len(unique_paths)
 
-                save_path = os.path.commonpath(p.parent for p in unique_paths)  # type: ignore [call-overload]
+                save_path = os.path.commonpath(p.parent for p in unique_paths)
                 renamed_files = {old["path"]: new.relative_to(save_path) for old, new in zip(files_info, unique_paths)}
                 yield torrent_file, infohash, save_path, renamed_files
 
 
 def _scrape_all(tracker_hashes: Dict[str, Set[str]], batchsize: int, delay: float) -> Iterator[Tuple[str, str, Any]]:
     for tracker_url, hashes in tracker_hashes.items():
-
         if not tracker_url:
             logging.warning("Could not find working tracker for: %s", hashes)
             continue

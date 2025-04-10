@@ -1,31 +1,64 @@
+[build-system]
+build-backend = "flit_core.buildapi"
+
+requires = [
+  "flit-core>=3.11,<4",
+]
+
+[project]
+name = "qbtool"
+version = "0.1.0"
+description = "qb-tool allows you to automate various qBittorrent tasks by using it's web api."
+readme = "readme.md"
+license = "ISC"
+authors = [ { name = "Dobatymo", email = "Dobatymo@users.noreply.github.com" } ]
+requires-python = ">=3.8"
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "bencode-py>=4",
+  "genutility[args,filesystem,iter,json,time,torrent,tree]>=0.0.99",
+  "platformdirs>=4",
+  "qbittorrent-api>=2022.5.32",
+  "requests>=2.32.3",
+  "typing-extensions>=4",
+]
+urls.Homepage = "https://github.com/Dobatymo/qb-tool"
+scripts.qbtool = "qbtool.qbtool:main"
+scripts.torrenttool = "qbtool.torrenttool:main"
+
+[tool.flit.sdist]
+exclude = [ "**/*.bak" ]
+
 [tool.black]
 line-length = 120
+
+[tool.ruff]
+line-length = 120
+lint.extend-select = [
+  "B",
+  "I",
+]
 
 [tool.isort]
 profile = "black"
 line_length = 120
 
 [tool.mypy]
+allow_redefinition = true
 ignore_missing_imports = true
+no_implicit_optional = true
+warn_redundant_casts = true
 warn_unused_configs = true
+warn_unused_ignores = true
+warn_unreachable = true
+strict_equality = true
 
-[tool.poetry]
-name = "qb-tool"
-version = "0.1.0"
-description = "qb-tool allows you to automate various qBittorrent tasks by using it's web api."
-authors = ["Dobatymo"]
-license = "ISC license"
-
-[tool.poetry.dependencies]
-python = "^3.7"
-qbittorrent-api = "^2022.5.32"
-requests = "^2.28.0"
-appdirs = "^1.4.4"
-"bencode.py" = "^4.0.0"
-genutility = "^0.0.86"
-
-[tool.poetry.dev-dependencies]
-
-[build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+[tool.bandit]
+skips = [ "B101" ]

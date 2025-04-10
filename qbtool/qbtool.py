@@ -5,15 +5,18 @@ from argparse import ArgumentParser, Namespace
 from collections import defaultdict
 from os import fspath
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Tuple
+from typing import Any, Dict, Iterable, Iterator, Literal, Tuple
 
 import bencodepy
 import qbittorrentapi
 from genutility.args import is_dir, is_file
 from genutility.json import json_lines, read_json
 from genutility.torrent import get_torrent_hash
+from typing_extensions import TypeAlias
 
-import common
+from . import common
+
+ContentLayoutT: TypeAlias = Literal["Original", "Subfolder", "NoSubfolder"]
 
 DEFAULT_CONFIG = {
     "category-name": "_Unregistered",
@@ -30,7 +33,7 @@ filtermap = {
 }
 
 
-def get_private_torrents(client: qbittorrentapi.Client, **kwargs) -> Iterator[Tuple[Any, List[dict]]]:
+def get_private_torrents(client: qbittorrentapi.Client, **kwargs) -> Iterator[Tuple[Any, qbittorrentapi.TrackersList]]:
     for torrent in client.torrents_info(**kwargs):
         trackers = client.torrents_trackers(torrent.hash)
         assert trackers[0]["url"] == "** [DHT] **"
@@ -54,7 +57,7 @@ def get_bad_torrents(client: qbittorrentapi.Client) -> Iterator[Dict[str, Any]]:
 
 
 def paused_private(client: qbittorrentapi.Client) -> Iterator[Any]:
-    for torrent, trackers in get_private_torrents(client, filter="paused"):
+    for torrent, _trackers in get_private_torrents(client, filter="paused"):
         if torrent.state == "pausedUP":
             yield torrent
 
@@ -84,7 +87,6 @@ def categorize_private_with_failed_trackers(client: qbittorrentapi.Client, args:
 
 
 def torrent_exists(client: qbittorrentapi.Client, hash: str) -> bool:
-
     try:
         client.torrents_properties(hash)
         return True
@@ -93,13 +95,12 @@ def torrent_exists(client: qbittorrentapi.Client, hash: str) -> bool:
 
 
 def remove_loaded_torrents(client: qbittorrentapi.Client, args: Namespace) -> None:
-
     num_remove = 0
     num_keep = 0
 
     for path in common._iter_torrent_files(args.path, args.recursive):
         try:
-            hash = get_torrent_hash(fspath(path))
+            hash = get_torrent_hash(path)
         except bencodepy.exceptions.BencodeDecodeError:
             logging.error("Failed to read torrent file: <%s>", path)
             continue
@@ -132,7 +133,7 @@ def scrape_loaded(client: qbittorrentapi.Client, args: Namespace) -> None:
     delay = 5.0
 
     all = defaultdict(set)
-    for torrent, trackers in get_private_torrents(client):
+    for torrent, _trackers in get_private_torrents(client):
         all[torrent["tracker"]].add(torrent.hash)
 
     with json_lines.from_path(args.out, "wt") as fw:
@@ -141,7 +142,6 @@ def scrape_loaded(client: qbittorrentapi.Client, args: Namespace) -> None:
 
 
 def move_by_availability(client: qbittorrentapi.Client, args: Namespace) -> None:
-
     import pandas as pd
 
     tuples = []
@@ -160,14 +160,14 @@ def move_by_availability(client: qbittorrentapi.Client, args: Namespace) -> None
 
 
 def _move_by_rename(
-    torrents_info: Iterable[qbittorrentapi.AttrDict],
+    torrents_info: Iterable[qbittorrentapi.TorrentDictionary],
     src: str,
     dest: str,
     regex: bool,
     match_start: bool,
     match_end: bool,
     case_sensitive: bool,
-) -> Iterator[Tuple[str, qbittorrentapi.AttrDict]]:
+) -> Iterator[Tuple[str, qbittorrentapi.TorrentDictionary]]:
     flags = re.IGNORECASE if not case_sensitive else 0
 
     if not regex:
@@ -221,9 +221,8 @@ def find_torrents(client: qbittorrentapi.Client, args: Namespace) -> None:
         logging.debug("Renamed files: %s", common.recstr(renamed_files))
         num_add_try += 1
         if args.do_add:
-
             if args.ignore_top_level_dir:
-                content_layout = "NoSubfolder"
+                content_layout: ContentLayoutT = "NoSubfolder"
             else:
                 content_layout = "Original"
 
@@ -233,7 +232,7 @@ def find_torrents(client: qbittorrentapi.Client, args: Namespace) -> None:
                     save_path=fspath(save_path),
                     is_skip_checking=False,
                     is_paused=False,
-                    content_layout=content_layout,
+                    content_layout=content_layout,  # type: ignore[arg-type]  # qbittorrentapi typo
                 )
             else:
                 result = client.torrents_add(
@@ -241,14 +240,16 @@ def find_torrents(client: qbittorrentapi.Client, args: Namespace) -> None:
                     save_path=fspath(save_path),
                     is_skip_checking=False,
                     is_paused=True,
-                    content_layout=content_layout,
+                    content_layout=content_layout,  # type: ignore[arg-type]  # qbittorrentapi typo
                 )
                 if result == "Ok.":
                     try:
                         for old_path, new_path in renamed_files.items():
-                            for i in range(3):
+                            for _i in range(3):
                                 try:
-                                    client.torrents_rename_file(infohash, old_path=old_path, new_path=new_path)
+                                    client.torrents_rename_file(
+                                        infohash, old_path=fspath(old_path), new_path=fspath(new_path)
+                                    )
                                     break
                                 except qbittorrentapi.exceptions.NotFound404Error as e:
                                     logging.warning(
@@ -273,8 +274,11 @@ def find_torrents(client: qbittorrentapi.Client, args: Namespace) -> None:
 
 
 def _rename_folders_regex(
-    contents: Iterable[Tuple[dict, dict]], src: str, dest: str, case_sensitive: bool
-) -> Iterator[Tuple[dict, str, str]]:
+    contents: Iterable[Tuple[qbittorrentapi.TorrentDictionary, qbittorrentapi.TorrentFilesList]],
+    src: str,
+    dest: str,
+    case_sensitive: bool,
+) -> Iterator[Tuple[qbittorrentapi.TorrentDictionary, str, str]]:
     flags = re.IGNORECASE if not case_sensitive else 0
 
     src_p = re.compile(src, flags)
@@ -291,7 +295,6 @@ def _rename_folders_regex(
 
 
 def rename_folders_regex(client: qbittorrentapi.Client, args: Namespace) -> None:
-
     """Possible renaming ops:
     - any sublevel `top-old/sub1-old/sub2-old` to `top-old/sub1-old/sub2-new`
     - any sublevel `top-old/sub1-old/sub2-old` to `top-old/sub1-new/sub2-old`
@@ -308,9 +311,9 @@ def rename_folders_regex(client: qbittorrentapi.Client, args: Namespace) -> None
     )
 
     for torrent, old_path, new_path in _rename_folders_regex(contents, args.src, args.dest, args.case_sensitive):
-
         print(f"Renaming folder of `{torrent['name']}` from <{old_path}> to <{new_path}>.")
         if args.do_rename:
+            assert isinstance(torrent["hash"], str)  # for mypy
             client.torrents_rename_folder(torrent["hash"], old_path, new_path)
 
 

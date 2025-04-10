@@ -9,11 +9,10 @@ from urllib.parse import urlsplit
 from genutility.args import is_dir
 from genutility.torrent import read_torrent
 
-import common
+from . import common
 
 
 def move_torrent_files_by_tracker(args: Namespace) -> None:
-
     if args.do_move and not args.out_dir:
         raise RuntimeError("Didn't provide output directory")
 
@@ -21,7 +20,7 @@ def move_torrent_files_by_tracker(args: Namespace) -> None:
         args.out_dir.mkdir(parents=True, exist_ok=True)
 
     for file in common._iter_torrent_files(args.torrents_dirs, args.recursive):
-        d = read_torrent(fspath(file))
+        d = read_torrent(file)
 
         announces = set()
         try:
@@ -49,7 +48,6 @@ def print_full_help(args: Namespace):
 
 
 def main():
-
     parser = ArgumentParser()
     parser.add_argument("--verbose", action="store_true", help="Show debug output")
     subparsers = parser.add_subparsers(dest="action", required=True)
