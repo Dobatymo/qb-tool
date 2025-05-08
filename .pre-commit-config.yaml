@@ -1,6 +1,6 @@
 repos:
 - repo: https://github.com/pre-commit/pre-commit-hooks
-  rev: v4.6.0
+  rev: v5.0.0
   hooks:
   - id: check-added-large-files
   - id: check-case-conflict
@@ -25,12 +25,12 @@ repos:
     entry: (?i)\b[a-z]:[\/\\][^<>*\"|?]+
     language: pygrep
 - repo: https://github.com/macisamuele/language-formatters-pre-commit-hooks
-  rev: v2.12.0
+  rev: v2.14.0
   hooks:
   - id: pretty-format-yaml
     args: [--autofix]
 - repo: https://github.com/tox-dev/pyproject-fmt
-  rev: 2.1.4
+  rev: 2.2.4
   hooks:
   - id: pyproject-fmt
 - repo: https://github.com/asottile/pyupgrade
@@ -39,7 +39,7 @@ repos:
   - id: pyupgrade
     args: [--py38-plus]
 - repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: v0.11.4
+  rev: v0.11.7
   hooks:
   - id: ruff
     args: [--fix]
